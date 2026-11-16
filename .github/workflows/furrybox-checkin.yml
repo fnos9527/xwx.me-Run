@@ -120,21 +120,32 @@ jobs:
                       btn.wait_for(state="visible", timeout=20000)
                       btn_text_before = btn.inner_text().strip()
                       toast = ""
+                      btn_text_click = btn_text_before
                       if btn.is_enabled():
+                          h = btn.element_handle()       # 记住这个按钮本身，点击后文字变了也能读到
                           btn.click()
-                          for _ in range(10):          # 等几秒，抓签到后的提示
-                              time.sleep(1)
+                          # 点击后（刷新前）等按钮文字变化，最多 15 秒；跳过“Checking in…/签到中…”这种过渡状态
+                          for _ in range(30):
+                              time.sleep(0.5)
+                              try:
+                                  cur = h.inner_text().strip()
+                              except Exception:
+                                  cur = ""
                               t = visible_toasts(page)
                               if t:
                                   toast = t
+                              if cur and cur != btn_text_before and not re.search(r"Checking in|签到中|チェックイン中", cur, re.I):
+                                  btn_text_click = cur
+                                  time.sleep(1)
+                                  toast = visible_toasts(page) or toast
                                   break
+                      else:
+                          btn_text_click = btn_text_before + "（按钮不可点）"
 
                       # 4. 刷新网页，再看积分
                       time.sleep(2)
                       page.reload(wait_until="networkidle")
                       after = read_balance(page)
-                      btn = checkin_btn(page)
-                      btn_text_after = btn.inner_text().strip() if btn.count() else "（没找到签到按钮）"
                       gain = after - before
 
                       now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
@@ -148,9 +159,7 @@ jobs:
                              f"签到后积分：{fmt(after)}\n"
                              f"本次获得：{'+' if gain >= 0 else ''}{fmt(gain)}")
                       if gain <= 0:
-                          msg += f"\n签到按钮显示：{btn_text_after}"
-                          if btn_text_before != btn_text_after:
-                              msg += f"（点击前是：{btn_text_before}）"
+                          msg += f"\n点击签到后按钮显示：{btn_text_click}"
                       if toast:
                           msg += f"\n网站提示：{toast[:200]}"
                       tg(msg)
