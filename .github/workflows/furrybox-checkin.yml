@@ -1,0 +1,177 @@
+name: FurryBox 每日签到
+
+on:
+  schedule:
+    - cron: "17 16 * * *"   # 每天北京时间 00:17（网站北京时间零点后才能签到；GitHub 定时可能晚几分钟到几十分钟）
+  workflow_dispatch:         # 允许在 Actions 页面手动点 Run workflow
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Playwright
+        run: |
+          pip install -q playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: 签到
+        env:
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cat > checkin.py <<'PY'
+          import os, re, time, datetime, requests
+          from playwright.sync_api import sync_playwright
+
+          LOGIN_URL = "https://id.furry.box/"
+          WALLET_URL = "https://my.furry.box/wallet"
+          EMAIL, PWD = os.environ["FB_EMAIL"], os.environ["FB_PASSWORD"]
+          TG_TOKEN, TG_CHAT = os.environ.get("TG_BOT_TOKEN", ""), os.environ.get("TG_CHAT_ID", "")
+
+          def tg(text):
+              print(text)
+              if TG_TOKEN and TG_CHAT:
+                  try:
+                      requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                                    json={"chat_id": TG_CHAT, "text": text}, timeout=20)
+                  except Exception as e:
+                      print("TG 发送失败:", e)
+
+          # 读取 “BOXES BALANCE” 下面的数字
+          READ_BAL = r"""
+          () => {
+            const isLabel = s => /^boxes\s*(balance|余额|残高)$/i.test(s.trim());
+            const labels = [...document.querySelectorAll('*')].filter(e => e.children.length === 0 && isLabel(e.textContent));
+            for (const lb of labels) {
+              let card = lb;
+              for (let i = 0; i < 5 && card; i++) {
+                card = card.parentElement; if (!card) break;
+                const lines = card.innerText.split('\n').map(s => s.trim()).filter(Boolean);
+                const k = lines.findIndex(isLabel);
+                for (let j = k + 1; j < lines.length; j++) {
+                  const m = lines[j].replace(/,/g, '').match(/^-?\d+(\.\d+)?$/);
+                  if (m) return Number(m[0]);
+                }
+              }
+            }
+            return null;
+          }
+          """
+          CHECKIN_BTN = re.compile(r"check|签到|チェックイン", re.I)
+
+          def read_balance(page):
+              for _ in range(30):
+                  v = page.evaluate(READ_BAL)
+                  if v is not None:
+                      return v
+                  time.sleep(1)
+              raise RuntimeError("没找到积分数字（页面可能没加载出来）")
+
+          def checkin_btn(page):
+              return page.locator("button").filter(has_text=CHECKIN_BTN).first
+
+          def visible_toasts(page):
+              # 收集页面上弹出的提示文字
+              txt = page.evaluate(r"""() => [...document.querySelectorAll('[role=alert],[role=status],[class*=toast],[class*=Toast],[class*=notice],[class*=snack]')]
+                  .filter(e => e.offsetParent !== null).map(e => e.innerText.trim()).filter(Boolean).join(' / ')""")
+              return txt
+
+          def fmt(x):
+              return int(x) if float(x).is_integer() else x
+
+          def main():
+              with sync_playwright() as p:
+                  b = p.chromium.launch(headless=True)
+                  ctx = b.new_context(locale="en-US",
+                                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+                                      viewport={"width": 1400, "height": 900})
+                  page = ctx.new_page()
+                  try:
+                      # 1. 登录
+                      page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+                      page.fill("#loginEmail", EMAIL)
+                      page.fill("#loginPassword", PWD)
+                      page.click("#loginSubmit")
+                      try:
+                          page.wait_for_url(lambda u: "id.furry.box" not in u, timeout=30000)
+                      except Exception:
+                          err = ""
+                          if page.locator("#loginError").count():
+                              err = page.locator("#loginError").inner_text().strip()
+                          raise RuntimeError("登录失败：" + (err or "登录后没有跳转"))
+                      page.wait_for_load_state("networkidle")
+
+                      # 2. 打开钱包页，记录签到前积分
+                      page.goto(WALLET_URL, wait_until="networkidle", timeout=60000)
+                      if "id.furry.box" in page.url:
+                          raise RuntimeError("打开钱包页时被要求重新登录")
+                      before = read_balance(page)
+                      print("签到前积分:", before)
+
+                      # 3. 点“Check in for 5 boxes”
+                      btn = checkin_btn(page)
+                      btn.wait_for(state="visible", timeout=20000)
+                      btn_text_before = btn.inner_text().strip()
+                      toast = ""
+                      if btn.is_enabled():
+                          btn.click()
+                          for _ in range(10):          # 等几秒，抓签到后的提示
+                              time.sleep(1)
+                              t = visible_toasts(page)
+                              if t:
+                                  toast = t
+                                  break
+
+                      # 4. 刷新网页，再看积分
+                      time.sleep(2)
+                      page.reload(wait_until="networkidle")
+                      after = read_balance(page)
+                      btn = checkin_btn(page)
+                      btn_text_after = btn.inner_text().strip() if btn.count() else "（没找到签到按钮）"
+                      gain = after - before
+
+                      now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+                      if gain > 0:
+                          head = "✅ FurryBox 签到成功"
+                      else:
+                          head = "⚠️ FurryBox 签到后积分没有增加"
+                      msg = (f"{head}（{now}）\n"
+                             f"账号：{EMAIL}\n"
+                             f"签到前积分：{fmt(before)}\n"
+                             f"签到后积分：{fmt(after)}\n"
+                             f"本次获得：{'+' if gain >= 0 else ''}{fmt(gain)}")
+                      if gain <= 0:
+                          msg += f"\n签到按钮显示：{btn_text_after}"
+                          if btn_text_before != btn_text_after:
+                              msg += f"（点击前是：{btn_text_before}）"
+                      if toast:
+                          msg += f"\n网站提示：{toast[:200]}"
+                      tg(msg)
+                  except Exception as e:
+                      tg(f"❌ FurryBox 签到失败\n账号：{EMAIL}\n原因：{str(e)[:300]}")
+                      try:
+                          page.screenshot(path="error.png", timeout=15000)
+                      except Exception:
+                          pass
+                      raise
+                  finally:
+                      b.close()
+
+          main()
+          PY
+          python checkin.py
+
+      - name: 失败时上传截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: error.png
+          if-no-files-found: ignore
